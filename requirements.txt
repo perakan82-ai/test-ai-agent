@@ -1,0 +1,8 @@
+streamlit>=1.40
+ccxt>=4.4
+google-genai>=1.20
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+feedparser>=6.0
+pydantic>=2.7
