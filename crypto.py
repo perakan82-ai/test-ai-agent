@@ -62,11 +62,19 @@ COIN_NAMES = {
     "ENA": ["ethena"], "WLD": ["worldcoin"], "FET": ["fetch.ai"], "HBAR": ["hedera"], "XLM": ["stellar"],
     "BCH": ["bitcoin cash"], "ETC": ["ethereum classic"], "FIL": ["filecoin"], "ICP": ["internet computer"],
     "TAO": ["bittensor"], "INJ": ["injective"], "SEI": ["sei"], "TIA": ["celestia"], "ONDO": ["ondo"],
+    "HYPE": ["hyperliquid"], "ZEC": ["zcash"], "PUMP": ["pump.fun", "pumpfun"],
 }
 
 # Google ปิด gemini-2.5-flash สำหรับผู้ใช้ใหม่แล้ว และแนะนำ gemini-3.8-flash
 # ถ้าโมเดลไหนใช้ไม่ได้ แอปจะสลับไปตัวที่ใช้ได้ให้อัตโนมัติ
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "อื่นๆ (พิมพ์เอง)"]
+
+DEFAULT_WATCHLIST = (
+    "BTC ETH SOL XRP XLM\n"
+    "ADA NEAR ENA HYPE AAVE\n"
+    "ZEC BNB PUMP UNI HBAR"
+)
+MAX_WATCHLIST = 40
 
 HORIZONS = {
     "SHORT": "⚡ ระยะสั้น (Scalping / Day Trade)",
@@ -126,17 +134,33 @@ def connect_binance() -> tuple[ccxt.binance, str]:
     raise RuntimeError(f"เชื่อมต่อ Binance ไม่ได้: {last_err}")
 
 
-def get_top_symbols(ex: ccxt.binance, n: int = 30) -> pd.DataFrame:
-    """Top N คู่ USDT เรียงตาม Quote Volume 24h (ไม่รวม stablecoin / wrapped)"""
+def parse_watchlist(text: str) -> list[str]:
+    """แปลงข้อความ เช่น 'BTC, ETH/USDT  solusdt' → ['BTC','ETH','SOL'] (ไม่ซ้ำ เรียงตามที่พิมพ์)"""
+    out = []
+    for tok in re.split(r"[\s,;]+", (text or "").upper()):
+        tok = re.sub(r"[/\-_]", "", tok)
+        if tok.endswith("USDT") and len(tok) > 4:
+            tok = tok[:-4]
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+
+def get_top_symbols(ex: ccxt.binance, n: int = 30, watchlist: list[str] | None = None) -> pd.DataFrame:
+    """Top N คู่ USDT ตาม Quote Volume 24h หรือเฉพาะเหรียญใน watchlist (ถ้าระบุ)"""
     tickers = ex.public_get_ticker_24hr()
     now_ms = time.time() * 1000
+    wanted = set(watchlist or [])
     rows = []
     for t in tickers:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
             continue
         base = sym[:-4]
-        if base in EXCLUDE_BASES:
+        if wanted:
+            if base not in wanted:
+                continue
+        elif base in EXCLUDE_BASES:
             continue
         price = safe_float(t.get("lastPrice"), 0)
         qvol = safe_float(t.get("quoteVolume"), 0)
@@ -150,9 +174,18 @@ def get_top_symbols(ex: ccxt.binance, n: int = 30) -> pd.DataFrame:
             "change_24h_%": safe_float(t.get("priceChangePercent"), 0),
             "quote_volume_usdt": qvol,
         })
+    if wanted:
+        missing = [c for c in watchlist if c not in {r["base"] for r in rows}]
+        if missing:
+            st.warning(f"ไม่พบคู่ USDT ที่เทรดอยู่บน Binance: {', '.join(missing)} (ข้ามไป)")
     if not rows:
-        raise RuntimeError("ไม่พบคู่เหรียญ USDT จาก Binance (ข้อมูล ticker ว่าง)")
-    df = pd.DataFrame(rows).sort_values("quote_volume_usdt", ascending=False).head(n)
+        raise RuntimeError("ไม่พบคู่เหรียญ USDT ที่ใช้ได้จาก Binance")
+    df = pd.DataFrame(rows)
+    if wanted:  # เรียงตามลำดับที่ผู้ใช้พิมพ์
+        order = {c: i for i, c in enumerate(watchlist)}
+        df = df.sort_values("base", key=lambda s: s.map(order))
+    else:
+        df = df.sort_values("quote_volume_usdt", ascending=False).head(n)
     return df.reset_index(drop=True)
 
 
@@ -265,9 +298,9 @@ def analyze_tf(df: pd.DataFrame) -> dict:
     }
 
 
-def run_data_agent(n_coins: int, progress) -> tuple[pd.DataFrame, dict, str]:
+def run_data_agent(n_coins: int, progress, watchlist: list[str] | None = None) -> tuple[pd.DataFrame, dict, str]:
     ex, host = connect_binance()
-    top = get_top_symbols(ex, n_coins)
+    top = get_top_symbols(ex, n_coins, watchlist)
     jobs = [(s, tf) for s in top["symbol"] for tf in TIMEFRAMES]
     results: dict[str, dict[str, dict]] = {s: {} for s in top["symbol"]}
     errors = 0
@@ -477,7 +510,7 @@ def run_master_agent(client, model, top, results, news_report: NewsReport | None
     prompt = f"""คุณคือ Master Trading Analyst ที่รวมผลจาก Data Agent และ News Agent
 เวลาปัจจุบัน (UTC): {datetime.now(timezone.utc):%Y-%m-%d %H:%M}
 
-=== ข้อมูลเทคนิค (Binance Spot, Top {len(top)} ตาม Volume) ===
+=== ข้อมูลเทคนิค (Binance Spot, {len(top)} เหรียญ) ===
 S/W/L = คะแนน rule-based ระยะสั้น/กลาง/ยาว (-3 ถึง +3)
 {market_table}
 
@@ -655,7 +688,23 @@ with st.sidebar:
     cp_plan = st.selectbox("CryptoPanic plan", ["developer", "growth", "enterprise"], index=0)
 
     st.divider()
-    n_coins = st.slider("จำนวนเหรียญที่สแกน (Top ตาม Volume)", 10, 30, 30)
+    st.subheader("🪙 เหรียญที่จะสแกน")
+    coin_mode = st.radio("เลือกแบบ", ["เลือกเหรียญเอง (Watchlist)", "Top ตาม Volume อัตโนมัติ"], index=0)
+    watchlist = None
+    n_coins = 30
+    if coin_mode.startswith("เลือก"):
+        wl_text = st.text_area(
+            "รายชื่อเหรียญ (คั่นด้วยเว้นวรรค / จุลภาค / ขึ้นบรรทัดใหม่)",
+            value=get_secret("WATCHLIST") or DEFAULT_WATCHLIST, height=140,
+            help="พิมพ์แค่ชื่อเหรียญ เช่น BTC ETH SOL หรือ BTCUSDT ก็ได้ ระบบจับคู่กับ USDT ให้เอง",
+        )
+        watchlist = parse_watchlist(wl_text)
+        if len(watchlist) > MAX_WATCHLIST:
+            st.warning(f"ใส่ได้สูงสุด {MAX_WATCHLIST} เหรียญ จะใช้ {MAX_WATCHLIST} ตัวแรก")
+            watchlist = watchlist[:MAX_WATCHLIST]
+        st.caption(f"เลือกไว้ {len(watchlist)} เหรียญ")
+    else:
+        n_coins = st.slider("จำนวนเหรียญที่สแกน (Top ตาม Volume)", 10, 30, 30)
     n_picks = st.slider("จำนวนเหรียญที่ให้ AI คัด", 5, 10, 7)
     scan = st.button("🚀 Scan Market Now", type="primary", width="stretch")
     st.caption("⚠️ ไม่ใช่คำแนะนำการลงทุน  Win Rate เป็นค่าประเมินของ AI ไม่ใช่ผล Backtest")
@@ -667,6 +716,9 @@ if scan:
     if not gemini_key:
         st.error("กรุณาใส่ GEMINI_API_KEY ใน Sidebar")
         st.stop()
+    if watchlist is not None and len(watchlist) < 3:
+        st.error("กรุณาใส่เหรียญใน Watchlist อย่างน้อย 3 เหรียญ")
+        st.stop()
     client = genai.Client(api_key=gemini_key)
     st.session_state["active_model"] = st.session_state.get("model_override", {}).get(model_choice, model_choice)
 
@@ -674,7 +726,7 @@ if scan:
         try:
             st.write("📊 Data Agent: ดึงราคาและคำนวณอินดิเคเตอร์")
             prog = st.progress(0.0)
-            top, results, host = run_data_agent(n_coins, prog)
+            top, results, host = run_data_agent(n_coins, prog, watchlist)
             st.write(f"✅ ได้ข้อมูล {len(top)} เหรียญ × {len(TIMEFRAMES)} TF (จาก {host})")
 
             st.write("📰 News Agent: ดึงข่าวและวิเคราะห์ Sentiment")
