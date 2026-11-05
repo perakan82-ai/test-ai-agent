@@ -467,7 +467,12 @@ def run_news_agent(client, model, symbols, cp_token, cp_plan) -> tuple[NewsRepor
 ข่าว:
 {headlines}
 """
-    report = call_gemini(client, model, prompt, NewsReport, temperature=0.2)
+    try:
+        report = call_gemini(client, model, prompt, NewsReport, temperature=0.2, max_retries=4)
+    except Exception as e:  # noqa: BLE001
+        # News Agent ล้มเหลวไม่ควรทำให้ทั้งการสแกนหยุด → ส่งพาดหัวข่าวดิบให้ Master Agent แทน
+        st.info(f"News Agent สรุปข่าวไม่สำเร็จ ({str(e)[:120]}) → ส่งพาดหัวข่าวให้ Master Agent วิเคราะห์เอง")
+        report = None
     return report, news, source_used
 
 
@@ -516,12 +521,16 @@ def build_market_table(top: pd.DataFrame, results: dict) -> str:
     return "\n".join(lines)
 
 
-def run_master_agent(client, model, top, results, news_report: NewsReport | None, n_picks: int) -> MasterReport:
+def run_master_agent(client, model, top, results, news_report: NewsReport | None, n_picks: int,
+                     news_items: list[dict] | None = None) -> MasterReport:
     market_table = build_market_table(top, results)
     if news_report:
         news_txt = (f"Overall: {news_report.overall_sentiment} ({news_report.overall_score})\n"
                     f"{news_report.summary_th}\n"
                     + "\n".join(f"- {c.symbol}: {c.sentiment} ({c.score}) {c.reason}" for c in news_report.coins))
+    elif news_items:
+        news_txt = ("(News Agent สรุปไม่สำเร็จ ให้ประเมิน Sentiment จากพาดหัวข่าวเหล่านี้เอง)\n"
+                    + "\n".join(f"- [{n['source']}] {n['title']}" for n in news_items[:30]))
     else:
         news_txt = "ไม่มีข้อมูลข่าว"
 
@@ -552,7 +561,7 @@ S/W/L = คะแนน rule-based ระยะสั้น/กลาง/ยา�
 7. ถ้าข่าวขัดกับเทคนิค ให้ลด win_rate และระบุใน risk_note
 8. reasoning และ risk_note เป็นภาษาไทย กระชับ อ้างอิงตัวเลขจริง
 """
-    return call_gemini(client, model, prompt, MasterReport, temperature=0.3)
+    return call_gemini(client, model, prompt, MasterReport, temperature=0.3, max_retries=6)
 
 
 def normalize_horizon(h: str) -> str:
@@ -645,6 +654,7 @@ def call_gemini(client, model: str, prompt: str, schema, temperature: float = 0.
     model = st.session_state.get("model_override", {}).get(model, model)
     requested, tried = model, {model}
     last_err = None
+    busy_count: dict[str, int] = {}
     attempt = 0
     while attempt < max_retries:
         attempt += 1
@@ -676,9 +686,20 @@ def call_gemini(client, model: str, prompt: str, schema, temperature: float = 0.
                     attempt -= 1
                     continue
             if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "503", "500", "UNAVAILABLE",
-                                       "INTERNAL", "overloaded", "DEADLINE")):
-                wait = 15 * attempt
-                st.toast(f"Gemini ติด rate limit / ไม่ว่าง — รอ {wait} วินาทีแล้วลองใหม่")
+                                       "INTERNAL", "overloaded", "high demand", "DEADLINE")):
+                busy_count[model] = busy_count.get(model, 0) + 1
+                # โมเดลนี้ล้นหรือโควต้าเต็มซ้ำ 2 ครั้ง → สลับไปโมเดลสำรอง (โควต้าฟรีแยกกันต่อโมเดล)
+                if busy_count[model] >= 2 and len(tried) < 6:
+                    new_model = find_replacement_model(client, "", tried)
+                    if new_model:
+                        st.toast(f"{model} คนใช้เยอะ / โควต้าเต็ม → สลับไปใช้ {new_model}")
+                        st.session_state.setdefault("model_override", {})[requested] = new_model
+                        st.session_state["active_model"] = new_model
+                        tried.add(new_model)
+                        model = new_model
+                        continue
+                wait = 10 * busy_count[model]
+                st.toast(f"Gemini ไม่ว่างชั่วคราว — รอ {wait} วินาทีแล้วลองใหม่")
                 time.sleep(wait)
                 continue
             if isinstance(e, ValueError):  # JSON ไม่สมบูรณ์ / ตอบว่าง (ValidationError เป็น ValueError)
@@ -753,7 +774,7 @@ if scan:
             st.write(f"✅ ข่าว {len(news_items)} รายการ จาก {news_src}")
 
             st.write("🧠 Master AI Agent: วิเคราะห์รวมและคัดเหรียญ")
-            master = run_master_agent(client, model_choice, top, results, news_report, n_picks)
+            master = run_master_agent(client, model_choice, top, results, news_report, n_picks, news_items)
             price_map = dict(zip(top["base"], top["price"]))
             picks = [validate_pick(p, price_map) for p in master.picks]
 
