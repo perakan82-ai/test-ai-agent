@@ -351,10 +351,27 @@ def run_data_agent(n_coins: int, progress, watchlist: list[str] | None = None) -
 # 2) NEWS AGENT
 # =============================================================================
 def fetch_cryptopanic(token: str, plan: str, limit: int = 50) -> list[dict]:
-    url = f"https://cryptopanic.com/api/{plan}/v2/posts/"
-    params = {"auth_token": token, "public": "true", "kind": "news", "regions": "en"}
-    r = requests.get(url, params=params, timeout=15, headers={"User-Agent": "crypto-scanner/1.0"})
-    r.raise_for_status()
+    """ลองแพลนที่เลือกก่อน ถ้า 404 ลองแพลนอื่นต่อ (แพลน developer ฟรีถูกยกเลิกแล้ว)"""
+    params = {"auth_token": token.strip(), "public": "true", "kind": "news", "regions": "en"}
+    plans = [plan] + [p for p in ("growth", "enterprise", "developer") if p != plan]
+    r, status_log = None, []
+    for pl in plans:
+        url = f"https://cryptopanic.com/api/{pl}/v2/posts/"
+        r = requests.get(url, params=params, timeout=15, headers={"User-Agent": "crypto-scanner/1.0"})
+        status_log.append(f"{pl}={r.status_code}")
+        if r.status_code == 404:
+            continue
+        break
+    if r is None or r.status_code != 200:
+        code = r.status_code if r is not None else "-"
+        reason = {
+            401: "token ไม่ถูกต้อง",
+            403: "แพลนของ token นี้ไม่มีสิทธิ์ใช้ API",
+            404: "ไม่พบ API สำหรับแพลนนี้ (แพลน Developer ฟรีถูกยกเลิกแล้ว ต้องใช้แพลนเสียเงิน)",
+            429: "เรียกถี่เกินโควต้า",
+        }.get(code, f"HTTP {code}")
+        # ไม่ใส่ URL ลงข้อความ error เพื่อไม่ให้ auth_token โผล่บนหน้าจอ
+        raise RuntimeError(f"{reason} [{', '.join(status_log)}]")
     items = []
     for p in r.json().get("results", [])[:limit]:
         instruments = p.get("instruments") or p.get("currencies") or []
@@ -427,7 +444,8 @@ def run_news_agent(client, model, symbols, cp_token, cp_plan) -> tuple[NewsRepor
             news = fetch_cryptopanic(cp_token, cp_plan)
             source_used = "CryptoPanic"
         except Exception as e:  # noqa: BLE001
-            st.warning(f"CryptoPanic ใช้ไม่ได้ ({e}) → สลับไปใช้ RSS")
+            msg = str(e).replace(cp_token, "***") if cp_token else str(e)
+            st.info(f"CryptoPanic ใช้ไม่ได้: {msg} → ใช้ข่าวจาก RSS แทน (ไม่กระทบผลวิเคราะห์)")
     if not news:
         news = fetch_rss_news(symbols)
         source_used = "RSS (CoinDesk / Cointelegraph / Decrypt)"
