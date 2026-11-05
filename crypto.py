@@ -95,6 +95,9 @@ COIN_NAMES = {
 
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "อื่นๆ (พิมพ์เอง)"]
 
+# เทรด Spot อย่างเดียว (ไม่มี Short / ไม่มี Leverage) — เปลี่ยนได้ที่ Sidebar
+SPOT_ONLY = True
+
 
 # =============================================================================
 # HELPERS
@@ -389,7 +392,14 @@ def analyze_tf(df: pd.DataFrame, tf: str) -> dict:
     df = add_indicators(df)
     last, prev = df.iloc[-1], df.iloc[-2]
     score = score_row(last)
-    direction = "LONG" if score >= 0 else "SHORT"
+    signal = "LONG" if score >= 0 else "SHORT"           # สัญญาณจริงของตลาด
+    direction = "LONG" if SPOT_ONLY else signal          # Spot = วางแผนซื้อเท่านั้น
+    if score >= 1:
+        spot_status = "🟢 ซื้อได้"
+    elif score >= 0:
+        spot_status = "🟡 รอจังหวะ"
+    else:
+        spot_status = "🔴 ยังไม่ควรซื้อ"
     if last["close"] > last["ema50"] > last["ema200"]:
         trend = "UP"
     elif last["close"] < last["ema50"] < last["ema200"]:
@@ -408,7 +418,8 @@ def analyze_tf(df: pd.DataFrame, tf: str) -> dict:
         "atr": float(last["atr"]), "atr_pct": round(float(last["atr"] / last["close"] * 100), 2),
         "bb_width": round(float(last["bb_width"]), 2), "vol_ratio": round(float(last["vol_ratio"]), 2),
         "hi50": float(df["high"].iloc[-50:].max()), "lo50": float(df["low"].iloc[-50:].min()),
-        "trend": trend, "score": round(score, 2), "direction": direction, "bt": bt, "plan": plan,
+        "trend": trend, "score": round(score, 2), "direction": direction, "signal": signal,
+        "spot_status": spot_status, "bt": bt, "plan": plan,
     }
 
 
@@ -428,6 +439,10 @@ def system_win_rate(d: dict, htf: dict | None) -> float:
         wr -= 4
     if d["vol_ratio"] >= 1.5:
         wr += 1
+    if d["direction"] != d["signal"]:  # Spot ซื้อทั้งที่สัญญาณยังเป็นขาลง
+        wr -= 8
+    elif abs(d["score"]) < 1:          # สัญญาณยังไม่ชัด
+        wr -= 3
     if d["bt"]["n"] < 8:  # ตัวอย่างน้อย → ดึงเข้าหา 45%
         wr = 0.5 * wr + 0.5 * 45
     return float(np.clip(wr, 20, 85))
@@ -642,7 +657,8 @@ def build_quant_table(top: pd.DataFrame, results: dict, news_map: dict) -> str:
                 continue
             p, bt = d["plan"], d["bt"]
             lines.append(
-                f"  {TF_LABEL[tf]}: {d['direction']} score={d['score']} trend={d['trend']} RSI={d['rsi']} "
+                f"  {TF_LABEL[tf]}: signal={d['signal']} plan={d['direction']} status={d['spot_status']} "
+                f"score={d['score']} trend={d['trend']} RSI={d['rsi']} "
                 f"ADX={d['adx']} MACDh={'+' if d['hist'] > 0 else '-'}{'↑' if d['hist_rising'] else '↓'} "
                 f"cross={d['macd_cross']} vol×{d['vol_ratio']} ATR%={d['atr_pct']} "
                 f"EMA20={fmt_price(d['ema20'])} EMA50={fmt_price(d['ema50'])} EMA200={fmt_price(d['ema200'])} "
@@ -696,8 +712,18 @@ hold = ช่วงเวลาที่เทรดชนะใช้จริ�
 5. ถ้าตลาด Risk-Off ให้ระยะ LONG เน้นโซนสะสมที่ต่ำกว่า (EMA50/EMA200 1D) และลด win_rate
 6. hold_period อ้างอิงคอลัมน์ hold ของ TF นั้น
 7. ทุกข้อความเป็นภาษาไทย กระชับ อ้างตัวเลขจริง
-"""
+{SPOT_RULES if SPOT_ONLY else ""}"""
     return call_gemini(client, model, prompt, StrategyReport, temperature=0.3, max_retries=6)
+
+
+SPOT_RULES = """
+=== สำคัญ: ผู้ใช้เทรด SPOT เท่านั้น (ไม่มี Short ไม่มี Leverage) ===
+8. direction ต้องเป็น LONG ทุกรายการ ห้ามแนะนำ SHORT เด็ดขาด
+9. เลือกเหรียญที่ status = 🟢 ซื้อได้ ก่อน ถ้าเป็น 🟡 รอจังหวะ ให้ระบุ entry_trigger ที่ต้องรอให้ชัด
+10. เหรียญ signal=SHORT (🔴 ยังไม่ควรซื้อ) ห้ามเลือกเป็นระยะ SHORT/SWING
+    ใช้ได้เฉพาะระยะ LONG แบบตั้ง Limit สะสมที่แนวรับ (Lo50 / EMA200 ของ 1D) ต่ำกว่าราคาปัจจุบัน และต้องลด win_rate
+11. ถ้าตลาดขาลงทั้งตลาด ให้คัดน้อยลงได้ และบอกใน best_horizon_now ว่าควรถือเงินสด (USDT) รอ
+"""
 
 
 # =============================================================================
@@ -726,8 +752,11 @@ def run_risk_manager(client, model, picks: list, macro: dict) -> RiskReport:
         f"BTn={p['bt_n']} expR={p['exp_r']:+.2f} confidence={p['confidence']} warnings={p['warnings']}"
         for p in picks)
     fng = macro["fng"]
+    spot_txt = ("ผู้ใช้เทรด SPOT เท่านั้น ไม่มี Leverage: ความเสี่ยงหลักคือซื้อเหรียญในช่วงขาลง "
+                "ให้ REJECT แผนที่ซื้อสวนเทรนด์ใน TF สั้น/กลาง และระวังการถือ altcoin หลายตัวที่วิ่งตาม BTC พร้อมกัน\n"
+                if SPOT_ONLY else "")
     prompt = f"""คุณคือ Risk Manager ตรวจแผนเทรดจาก Strategist อย่างเข้มงวด
-Macro: BTC 1D {macro['btc_1d']}, regime {macro['regime']}, Fear&Greed {fng['value'] if fng else '-'}
+{spot_txt}Macro: BTC 1D {macro['btc_1d']}, regime {macro['regime']}, Fear&Greed {fng['value'] if fng else '-'}
 
 แผนที่ต้องตรวจ:
 {rows}
@@ -783,9 +812,10 @@ def finalize_pick(ai: AIPick, top: pd.DataFrame, results: dict) -> dict | None:
         return None
     direction = "SHORT" if "SHORT" in (ai.direction or "").upper() or "SELL" in (ai.direction or "").upper() else "LONG"
     if horizon == "LONG":
-        direction = "LONG"
+        direction = "LONG"  # ระยะยาว = สะสม (ถ้า AI ให้ตัวเลขฝั่ง Short จะถูกแทนด้วยแผนระบบด้านล่าง)
+    if SPOT_ONLY and direction == "SHORT":
+        return None  # Spot เปิด Short ไม่ได้ → ตัดสัญญาณระยะสั้น/กลางที่เป็น Short ทิ้ง
     warns = []
-    lv = [ai.stop_loss, ai.entry_low, ai.entry, ai.entry_high, ai.tp1, ai.tp2]
     lo, hi = min(ai.entry_low, ai.entry_high), max(ai.entry_low, ai.entry_high)
     lv = [ai.stop_loss, lo, ai.entry, hi, ai.tp1, ai.tp2]
     cur = d["close"]
@@ -798,8 +828,9 @@ def finalize_pick(ai: AIPick, top: pd.DataFrame, results: dict) -> dict | None:
     risk = abs(e - sl)
     sys_wr = d["sys_wr"]
     wr = int(np.clip(ai.win_rate, max(5, sys_wr - 10), min(85, sys_wr + 10)))
-    if direction != d["direction"]:
-        warns.append(f"สวนทางสัญญาณระบบ TF {TF_LABEL[tf]} ({d['direction']})")
+    if direction != d["signal"]:
+        warns.append(f"สัญญาณ TF {TF_LABEL[tf]} ยังเป็นขาลง — ซื้อแบบตั้ง Limit ที่โซนล่างเท่านั้น อย่าไล่ราคา"
+                     if SPOT_ONLY else f"สวนทางสัญญาณระบบ TF {TF_LABEL[tf]} ({d['signal']})")
     gap = (e - cur) / cur * 100
     if abs(gap) > 5:
         warns.append(f"Entry ห่างราคาปัจจุบัน {gap:+.1f}% (ตั้ง Limit order รอ)")
@@ -815,7 +846,7 @@ def finalize_pick(ai: AIPick, top: pd.DataFrame, results: dict) -> dict | None:
         "bt_hold": d["bt"]["hold_txt"], "hold_period": ai.hold_period, "entry_trigger": ai.entry_trigger,
         "technical_reason": ai.technical_reason, "news_reason": ai.news_reason,
         "invalidation": ai.invalidation, "confidence": ai.confidence,
-        "rsi": d["rsi"], "adx": d["adx"], "trend": d["trend"],
+        "rsi": d["rsi"], "adx": d["adx"], "trend": d["trend"], "spot_status": d["spot_status"],
         "verdict": "-", "risk_pct": None, "risk_note": "", "warnings": warns,
     }
 
@@ -987,6 +1018,8 @@ with st.sidebar:
     if model_choice.startswith("อื่นๆ"):
         model_choice = st.text_input("ชื่อโมเดล", value="gemini-3.8-flash")
     use_risk = st.toggle("ใช้ Risk Manager Agent", value=True, help="+1 การเรียก Gemini ต่อการสแกน")
+    SPOT_ONLY = st.toggle("เทรด Spot อย่างเดียว (ไม่มี Short)", value=True,
+                          help="ปิดถ้าเทรด Futures และต้องการสัญญาณ Short ด้วย")
 
     st.divider()
     st.subheader("🪙 เหรียญที่จะสแกน")
@@ -1071,7 +1104,7 @@ if scan:
                 "time": datetime.now(timezone.utc), "top": top, "results": results, "macro": macro,
                 "news_report": news_report, "news_items": news_items, "news_src": news_src,
                 "strat": strat, "picks": picks, "risk": risk_report,
-                "model": st.session_state.get("active_model", model_choice), "secs": time.time() - t0,
+                "model": st.session_state.get("active_model", model_choice), "secs": time.time() - t0, "spot": SPOT_ONLY,
             }
             status.update(label=f"สแกนเสร็จ ✅ ({time.time() - t0:.0f} วินาที)", state="complete", expanded=False)
         except Exception as e:  # noqa: BLE001
@@ -1098,16 +1131,22 @@ if not data:
 # =============================================================================
 top, results, macro, picks = data["top"], data["results"], data["macro"], data["picks"]
 nr, strat, rr = data["news_report"], data["strat"], data["risk"]
+spot = data.get("spot", True)
 
-# ขนาดไม้
+# ขนาดไม้ (Spot: ซื้อได้ไม่เกินทุน ไม่มี Leverage)
 for p in picks:
     rp = min(risk_pct_user, p["risk_pct"]) if p["risk_pct"] else risk_pct_user
     risk_amt = capital * rp / 100
     per_unit = abs(p["entry"] - p["stop_loss"])
     qty = risk_amt / per_unit if per_unit else 0
-    p["pos_usdt"] = qty * p["entry"]
-    p["risk_amt"] = risk_amt
-    p["risk_used_pct"] = rp
+    pos = qty * p["entry"]
+    p["capped"] = spot and pos > capital
+    if p["capped"]:
+        pos = capital
+        risk_amt = pos / p["entry"] * per_unit
+        rp = round(risk_amt / capital * 100, 2)
+    p["pos_usdt"], p["risk_amt"], p["risk_used_pct"] = pos, risk_amt, rp
+    p["qty"] = pos / p["entry"] if p["entry"] else 0
 
 bkk = data["time"].astimezone(timezone(timedelta(hours=7)))
 st.caption(f"สแกนล่าสุด {bkk:%d/%m/%Y %H:%M} (เวลาไทย) · โมเดล {data['model']} · ใช้เวลา {data['secs']:.0f} วินาที")
@@ -1141,7 +1180,7 @@ with tab1:
         table = pd.DataFrame([{
             "สถานะ": VERDICT_ICON.get(p["verdict"], "•"),
             "เหรียญ": p["symbol"], "ระยะ": HZ_SHORT[p["horizon"]], "TF": TF_LABEL[p["timeframe"]],
-            "ทิศทาง": "🟢 LONG" if p["direction"] == "LONG" else "🔴 SHORT",
+            "ทิศทาง": p["spot_status"] if spot else ("🟢 LONG" if p["direction"] == "LONG" else "🔴 SHORT"),
             "Win Rate": p["win_rate"],
             "ราคาตอนนี้": fmt_price(p["current"]),
             "โซนเข้า": f"{fmt_price(p['entry_low'])} – {fmt_price(p['entry_high'])}",
@@ -1152,14 +1191,15 @@ with tab1:
             "R:R": f"1:{p['rr']} / 1:{p['rr2']}",
             "ถือประมาณ": p["hold_period"],
             "Backtest": f"{p['bt_wr']:.0f}% (n={p['bt_n']})" if not np.isnan(p["bt_wr"]) else "-",
-            "ขนาดไม้": f"{p['pos_usdt']:,.0f} USDT",
+            "ซื้อ (USDT)": f"{p['pos_usdt']:,.0f}" + (" (เต็มทุน)" if p["capped"] else ""),
             "ความมั่นใจ": p["confidence"],
         } for p in picks_sorted])
         st.dataframe(table, width="stretch", hide_index=True, column_config={
             "Win Rate": st.column_config.ProgressColumn("Win Rate", min_value=0, max_value=100, format="%d%%"),
         })
-        st.caption("✅ ผ่าน · ⚠️ ระวัง · ❌ Risk Manager ไม่แนะนำ | ขนาดไม้ = มูลค่าที่ควรซื้อเพื่อให้ขาดทุนถึง SL "
-                   f"ไม่เกิน {risk_pct_user}% ของทุน (หรือตามที่ Risk Manager แนะนำถ้าน้อยกว่า)")
+        st.caption("✅ ผ่าน · ⚠️ ระวัง · ❌ Risk Manager ไม่แนะนำ | ซื้อ (USDT) = จำนวนเงินที่ควรซื้อ เพื่อให้ถ้าโดน SL "
+                   f"ขาดทุนไม่เกิน {risk_pct_user}% ของทุน (หรือตาม Risk Manager ถ้าน้อยกว่า)"
+                   + (" · โหมด Spot: ไม่มีสัญญาณ Short และไม่ใช้ Leverage" if spot else ""))
 
         st.subheader("📊 Win Rate เทียบ Backtest")
         st.plotly_chart(win_rate_chart(picks_sorted), width="stretch")
@@ -1173,7 +1213,8 @@ with tab1:
                 continue
             for p in group:
                 icon = VERDICT_ICON.get(p["verdict"], "•")
-                arrow = "🟢 LONG" if p["direction"] == "LONG" else "🔴 SHORT"
+                arrow = (f"Spot {p['spot_status']}" if spot
+                         else ("🟢 LONG" if p["direction"] == "LONG" else "🔴 SHORT"))
                 with st.expander(f"{icon} {p['symbol']}/USDT · {arrow} · TF {TF_LABEL[p['timeframe']]} · "
                                  f"Win {p['win_rate']}% · ถือ {p['hold_period']}", expanded=p is group[0]):
                     c = st.columns(6)
@@ -1196,10 +1237,15 @@ with tab1:
                         st.markdown(f"**🚫 แผนเป็นโมฆะเมื่อ:** {p['invalidation']}")
                         if p["risk_note"]:
                             st.markdown(f"**🛡️ Risk Manager ({p['verdict']}):** {p['risk_note']}")
-                        st.markdown(f"**💰 ขนาดไม้:** ~{p['pos_usdt']:,.0f} USDT (เสี่ยง {p['risk_amt']:,.2f} USDT "
-                                    f"= {p['risk_used_pct']}% ของทุน)")
-                        if p["pos_usdt"] > capital:
-                            st.caption("ขนาดไม้เกินทุน = ต้องใช้ Leverage หรือลดความเสี่ยงต่อไม้ลง")
+                        st.markdown(f"**💰 ซื้อ:** ~{p['pos_usdt']:,.0f} USDT ≈ {p['qty']:,.4g} {p['symbol']} "
+                                    f"(ถ้าโดน SL ขาดทุน {p['risk_amt']:,.2f} USDT = {p['risk_used_pct']}% ของทุน)")
+                        st.markdown(f"**🧾 วิธีตั้ง:** Limit Buy ในโซน {fmt_price(p['entry_low'])}–"
+                                    f"{fmt_price(p['entry_high'])} → ขายครึ่งที่ TP1 {fmt_price(p['tp1'])} "
+                                    f"→ เลื่อน SL มาที่ทุน → ขายที่เหลือที่ TP2 {fmt_price(p['tp2'])} · "
+                                    f"ตั้ง Stop-Limit ขายที่ {fmt_price(p['stop_loss'])}")
+                        if p["capped"]:
+                            st.caption("SL แคบมากจนขนาดไม้เกินทุน → จำกัดไว้ที่ทุนทั้งหมด (Spot ไม่มี Leverage) "
+                                       "ควรแบ่งทุนให้หลายเหรียญแทนการลงตัวเดียว")
                     st.caption(f"RSI {p['rsi']} · ADX {p['adx']} · Trend {p['trend']} · Backtest n={p['bt_n']} · "
                                f"Expectancy {p['exp_r']:+.2f}R · ความมั่นใจ {p['confidence']}")
                     for w in p["warnings"]:
@@ -1229,7 +1275,8 @@ with tab2:
         p, bt = d["plan"], d["bt"]
         e = p["entry"]
         rows.append({
-            "เหรียญ": r["base"], "กลุ่ม": r["source"], "สัญญาณ": "🟢 LONG" if d["direction"] == "LONG" else "🔴 SHORT",
+            "เหรียญ": r["base"], "กลุ่ม": r["source"],
+            "สัญญาณ": d["spot_status"] if spot else ("🟢 LONG" if d["direction"] == "LONG" else "🔴 SHORT"),
             "Score": d["score"], "Trend": d["trend"], "RSI": d["rsi"], "ADX": d["adx"],
             "Win Rate ระบบ": d["sys_wr"],
             "Backtest": f"{bt['wr_raw']:.0f}% (n={bt['n']})" if bt["n"] else "-",
@@ -1285,6 +1332,13 @@ with tab4:
 - **SL / TP1 / TP2**: SL = {SL_ATR['1h']}–{SL_ATR['1d']} × ATR · แนะนำปิดครึ่งหนึ่งที่ TP1 แล้วเลื่อน SL มาที่ทุน
 - **ขนาดไม้**: คำนวณให้ถ้าโดน SL จะขาดทุนไม่เกิน % ที่ตั้งไว้ใน Sidebar
 - **Score -3..+3**: คะแนนเทคนิคจาก EMA20/50/200, MACD, RSI, ADX
+
+**โหมด Spot (ค่าเริ่มต้น)**
+- 🟢 **ซื้อได้**: แนวโน้มขาขึ้นชัด (Score ≥ 1) เข้าตามโซนได้
+- 🟡 **รอจังหวะ**: สัญญาณยังไม่ชัด รอเงื่อนไขในช่อง "เงื่อนไขเข้า" ก่อน
+- 🔴 **ยังไม่ควรซื้อ**: ขาลง ถ้าจะสะสมระยะยาว ให้ตั้ง Limit ที่แนวรับด้านล่างเท่านั้น อย่าไล่ราคา
+- Spot ไม่มี Stop Loss อัตโนมัติจากตำแหน่ง ต้องตั้ง **Stop-Limit (ขาย)** ไว้ที่ราคา SL เอง
+- ช่วงตลาดขาลงทั้งตลาด การถือ USDT รอก็เป็นทางเลือกที่ดี
 
 ⚠️ สถิติในอดีตไม่รับประกันอนาคต ข่าวด่วนทำให้ราคาวิ่งผ่าน SL ได้ ควรเช็กกราฟจริงก่อนเข้าเทรดทุกครั้ง
 """)
