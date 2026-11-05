@@ -64,7 +64,9 @@ COIN_NAMES = {
     "TAO": ["bittensor"], "INJ": ["injective"], "SEI": ["sei"], "TIA": ["celestia"], "ONDO": ["ondo"],
 }
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview", "อื่นๆ (พิมพ์เอง)"]
+# Google ปิด gemini-2.5-flash สำหรับผู้ใช้ใหม่แล้ว และแนะนำ gemini-3.8-flash
+# ถ้าโมเดลไหนใช้ไม่ได้ แอปจะสลับไปตัวที่ใช้ได้ให้อัตโนมัติ
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "อื่นๆ (พิมพ์เอง)"]
 
 HORIZONS = {
     "SHORT": "⚡ ระยะสั้น (Scalping / Day Trade)",
@@ -552,14 +554,49 @@ def validate_pick(p: TradePick, price_map: dict) -> dict:
 # =============================================================================
 # GEMINI WRAPPER (retry สำหรับ Free Tier 429)
 # =============================================================================
+def find_replacement_model(client, err_msg: str, tried: set) -> str | None:
+    """หาโมเดลสำรองเมื่อโมเดลที่เลือกถูกยกเลิก (404 NOT_FOUND)"""
+    # 1) โมเดลที่ Google แนะนำในข้อความ error เช่น "...use models/gemini-3.8-flash for..."
+    for m in re.findall(r"models/([\w.\-]+)", err_msg):
+        if m not in tried:
+            return m
+    # 2) ถามรายชื่อโมเดลที่คีย์นี้ใช้ได้จริง เลือก flash ล่าสุด
+    try:
+        names = []
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "flash" not in name or (actions and "generateContent" not in actions):
+                continue
+            if any(k in name for k in ("image", "tts", "live", "audio", "embedding", "thinking")):
+                continue
+            names.append(name)
+
+        def rank(n):  # ไม่ preview ดีกว่า, ไม่ lite ดีกว่า, เวอร์ชันใหม่กว่าดีกว่า
+            ver = [int(x) for x in re.findall(r"\d+", n)[:2]] or [0]
+            return ("preview" not in n and "exp" not in n, "lite" not in n, ver)
+
+        for n in sorted(names, key=rank, reverse=True):
+            if n not in tried:
+                return n
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def call_gemini(client, model: str, prompt: str, schema, temperature: float = 0.3, max_retries: int = 4):
     cfg = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
         temperature=temperature,
     )
+    # ถ้าเคยสลับโมเดลไปแล้วในการสแกนนี้ ใช้ตัวที่สลับไว้เลย
+    model = st.session_state.get("model_override", {}).get(model, model)
+    requested, tried = model, {model}
     last_err = None
-    for attempt in range(max_retries):
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
         try:
             resp = client.models.generate_content(model=model, contents=prompt, config=cfg)
             parsed = getattr(resp, "parsed", None)
@@ -576,9 +613,20 @@ def call_gemini(client, model: str, prompt: str, schema, temperature: float = 0.
         except Exception as e:  # noqa: BLE001
             last_err = e
             msg = str(e)
+            # โมเดลถูกยกเลิก / ไม่มีสิทธิ์ใช้ → สลับโมเดลอัตโนมัติ (ไม่นับเป็นการลองซ้ำ)
+            if ("404" in msg or "NOT_FOUND" in msg) and len(tried) < 6:
+                new_model = find_replacement_model(client, msg, tried)
+                if new_model:
+                    st.toast(f"โมเดล {model} ใช้ไม่ได้แล้ว → สลับไปใช้ {new_model}")
+                    st.session_state.setdefault("model_override", {})[requested] = new_model
+                    st.session_state["active_model"] = new_model
+                    tried.add(new_model)
+                    model = new_model
+                    attempt -= 1
+                    continue
             if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "503", "500", "UNAVAILABLE",
                                        "INTERNAL", "overloaded", "DEADLINE")):
-                wait = 15 * (attempt + 1)
+                wait = 15 * attempt
                 st.toast(f"Gemini ติด rate limit / ไม่ว่าง — รอ {wait} วินาทีแล้วลองใหม่")
                 time.sleep(wait)
                 continue
@@ -598,7 +646,7 @@ with st.sidebar:
                                help="สร้างฟรีที่ aistudio.google.com/apikey")
     model_choice = st.selectbox("Gemini Model", GEMINI_MODELS, index=0)
     if model_choice.startswith("อื่นๆ"):
-        model_choice = st.text_input("ชื่อโมเดล", value="gemini-2.5-flash")
+        model_choice = st.text_input("ชื่อโมเดล", value="gemini-3.8-flash")
 
     st.divider()
     st.subheader("📰 News Agent")
@@ -620,6 +668,7 @@ if scan:
         st.error("กรุณาใส่ GEMINI_API_KEY ใน Sidebar")
         st.stop()
     client = genai.Client(api_key=gemini_key)
+    st.session_state["active_model"] = st.session_state.get("model_override", {}).get(model_choice, model_choice)
 
     with st.status("กำลังสแกนตลาด...", expanded=True) as status:
         try:
@@ -642,7 +691,7 @@ if scan:
                 "time": datetime.now(timezone.utc),
                 "top": top, "news_report": news_report, "news_items": news_items,
                 "news_src": news_src, "overview": master.market_overview, "picks": picks,
-                "model": model_choice,
+                "model": st.session_state.get("active_model", model_choice),
             }
             status.update(label="สแกนเสร็จแล้ว ✅", state="complete", expanded=False)
         except Exception as e:  # noqa: BLE001
